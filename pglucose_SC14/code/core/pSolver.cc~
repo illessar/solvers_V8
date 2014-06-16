@@ -1,0 +1,812 @@
+#include "utils/System.h"
+#include "core/pSolver.h"
+#include "mtl/Sort.h"
+#include <iostream>
+#include <signal.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sstream>
+using namespace Glucose;
+
+int pSolver::nbworkers=0;
+pSolver ** pSolver::solvers=0;
+int pSolver::folio=false;
+Queue<Lit> pSolver::vars;
+
+// This method executes the main procedure 
+// of the resolution process:  a thread starts
+// first in portfolio mode then switches   
+// to divide and conquer mode. When it terminates 
+// it goes in a spin loop waiting a cancellation
+// signal from the pricipal process
+void* pSolver::thread_work() {
+  if(!folio) 
+    searchSubProblem();
+  else
+    getPromisingOrder();
+
+  while(true) usleep(5000);
+
+  return 0;
+}
+
+//The bootstrap function that have to be 
+//executed by each process
+void* pSolver::bootstrap(void * arg) {
+  pSolver* solver = (pSolver *)arg;
+  return solver->thread_work();
+}
+
+//Create a worker that will handle subproblems
+pthread_t pSolver::create_worker(void *arg) {
+  pthread_t tid;
+  pthread_create(&tid, 0, &pSolver:: bootstrap, arg); 
+  return tid;
+}
+
+//Replay a set of assignements 
+//to position back the solver to 
+//a certain point.
+lbool pSolver::playAssumptions(){
+    
+  while (decisionLevel() < assumptions.size()){
+    // Perform user provided assumption:
+    Lit p = assumptions[decisionLevel()];
+    if (value(p) == l_True){
+      newDecisionLevel();
+    }else if (value(p) == l_False){
+      return l_False;  
+    }else{
+      newDecisionLevel();
+      uncheckedEnqueue(p);
+      propagate();
+    }
+  }
+  
+  return l_True;
+}
+
+
+//Construct the starting points (literals)
+//of the portfolio phase of the solving process
+void pSolver::getfirstLits(){
+
+  int dist=distance;
+
+  random_var_freq=1;
+  Lit   l=lit_Undef;
+  do 
+      l = pickBranchLit();
+  while(watches[l].size() == 0);
+  random_var_freq=0;
+
+  for(int i=0; i <nbworkers-1;++i)
+    vars.insert(l);
+
+  while(dist != 0){
+   
+    for(int i=0; i <nbworkers-1;++i){
+      Lit e = vars.peek(); vars.pop();
+      vec<Watcher>&  ws  = watches[e];
+      int cl= irand(random_seed, ws.size());
+      Clause&  c         = ca[ws[cl].cref];
+
+      Lit li= e;
+      
+      for(int k=0; k <c.size();++k){
+	if( c[k] != e && 
+	    watches[c[k]].size() == 0 &&
+	    value(c[k]) != l_Undef){
+	  li = c[k];
+	  break;
+	}
+      }
+      
+      vars.insert(li);   
+    }	
+    dist--;
+  }
+}
+
+
+//Portfolio phase: try to find 
+//a solution or at least find a
+//promising literals' order that
+//can be exploited in the devide and conquer
+// phase. 
+void  pSolver::getPromisingOrder(){
+  lbool ret;
+  
+  model.clear();
+  conflict.clear();
+  nbjobs = 0;
+
+  if (!ok) return;
+
+  sumLBD = 0;  
+  lbdQueue.initSize(sizeLBDQueue);
+  trailQueue.initSize(sizeTrailQueue);
+  nbclausesbeforereduce = firstReduceDB;    
+  cancelUntil(0);
+  
+  solves++;  
+
+  
+   Lit   next = lit_Undef;
+  //Lit   next = vars[id -1];
+
+  nbjobs++;   
+  
+  //Perform a CDCL search process on the problem
+  //Beside, learn new clauses from othern workers.  
+  while( l_Undef == ( ret =  search(next)) ){
+    pthread_testcancel();   
+    //Update the DB of learned clauses by
+    //those of other workers
+    sharedBase->update(this);
+    next =lit_Undef;
+  }
+    
+  //The problem is SAT
+  if (ret == l_True) {
+    mpz_t tmp;  
+    mpz_init(tmp);
+    thtime += cpuThreadTime(); 
+    mpz_set_si(tmp, 1);
+    sharedJob->putResult(tmp);
+    mpz_clear(tmp); 
+    
+    solvers[0]->model.growTo(nVars());
+    for (int i = 0; i < nVars(); i++) 
+      solvers[0]->model[i] = value(i);
+    return;
+  } 
+ 
+  //The problem is UNSAT
+  if (ret == l_False) {
+    mpz_t tmp;  
+    mpz_init(tmp);
+    thtime += cpuThreadTime(); 
+    mpz_set_si(tmp, -1);
+    sharedJob->putResult(tmp);
+    mpz_clear(tmp); 
+    return;
+  } 
+ 
+
+}
+
+
+
+//Tha main thread's work: pick a subproblem and try to solve 
+//it. If it too hard try to decopmose it and dispach
+//parts to idle workers. 
+void pSolver::searchSubProblem() {
+  lbool ret;
+  
+  model.clear();
+  conflict.clear();
+  nbjobs = 0;
+
+  if (!ok) return;
+
+  while (true) {
+  start:
+    sumLBD = 0; conflicts=0;
+    lbdQueue.initSize(sizeLBDQueue);
+    trailQueue.initSize(sizeTrailQueue);
+    nbclausesbeforereduce = firstReduceDB;    
+    cancelUntil(0);
+    
+    
+    if (!sharedJob->pop(assumptions)) {
+      mpz_t tmp;  
+      mpz_init(tmp);
+      mpz_set_si(tmp, -1);
+      sharedJob->putResult(tmp);
+      mpz_clear(tmp); 
+      thtime += cpuThreadTime();
+      break;
+    }
+    
+    
+    solves++;  
+
+    //Decompose the subproblem if it
+    //is the last in the queue
+    if(nAssigns() <= percentage * nVars() &&
+       sharedJob->getJobLeft() ==0){
+      
+      if(playAssumptions() == l_False){
+	goto start;
+      }
+      else
+	 createJobs(decisionLevel()+sharedJob->getHeight());
+      continue;
+    }
+    
+    nbjobs++;   
+
+    //Perform a CDCL search process on the
+    //subproblem while it is Undef: not known to be SAT or UNSAT.
+    //Beside, learn new clauses from othern workers.  
+    while( l_Undef == ( ret =  search(0)) ){
+      
+      pthread_testcancel();   
+
+      //Update the DB of learned clauses by
+      //those of other workers
+      sharedBase->update(this);
+            
+      //If the subproblem is Undef and
+      //the number of assigned variables is less
+      //than a percentage, and there is some idle thread
+      //then decompose the subproblem.
+      if(nAssigns() <= percentage * nVars() &&
+	 sharedJob->getJobLeft() ==0){
+	if(playAssumptions() == l_False)
+	  goto start;
+	else
+	   createJobs(decisionLevel()+sharedJob->getHeight());
+	break;
+      }
+    }
+    
+    //The subproblem is SAT then
+    //the initial problem is also SAT 
+    if (ret == l_True) {
+      mpz_t tmp;  
+      mpz_init(tmp);
+      thtime += cpuThreadTime(); 
+      mpz_set_si(tmp, 1);
+      sharedJob->putResult(tmp);
+      mpz_clear(tmp);
+
+      solvers[0]->model.growTo(nVars());
+      for (int i = 0; i < nVars(); i++) 
+	solvers[0]->model[i] = value(i);
+
+      break;
+    }
+ 
+  }
+}
+
+//This procedure generates subproblems the 
+//assumption of which have a size of h (the numbre of 
+//decision levels is g. t. e. to h)
+bool pSolver::createJobs(unsigned int h){
+  assert(ok); 
+
+ 
+  // Unit propagation
+  CRef confl = propagate();
+
+  if ((unsigned) confl != CRef_Undef){
+    // CONFLICT : just store the learnt clause.
+    int         backtrack_level;
+    vec<Lit>    learnt_clause;
+    unsigned int nblevels;      
+
+    conflicts++; 	    
+    learnt_clause.clear();
+    analyze(confl, learnt_clause, backtrack_level,nblevels);
+               
+    if (learnt_clause.size() != 1){
+      CRef cr = ca.alloc(learnt_clause, true);
+      learnts.push(cr);
+      attachClause(cr);
+      claBumpActivity(ca[cr]);
+    }
+
+    varDecayActivity();
+    claDecayActivity();
+    
+    return false;
+
+  }else{
+
+    //The decion level 'h' is reached:
+    // inqueue the new found job and return
+    if(decisionLevel()>=(int)h){
+      sharedJob->push(trail);
+      return false;
+    }
+
+    decisions++;
+    
+    Lit next =  pickBranchLit();
+   
+    // If all vars are assigned 
+    if (next == lit_Undef){
+      return true;
+    }
+    // At least one var is not assigned, 
+    // compute create a branch for next
+    // and an other for !next
+    else {
+      newDecisionLevel();
+      uncheckedEnqueue(next);
+      bool res=false;
+      if (!(res= createJobs(h))){
+	cancelUntil(decisionLevel()-1);
+	newDecisionLevel();
+	uncheckedEnqueue(~next);
+	res =  createJobs(h);
+	cancelUntil(decisionLevel()-1);
+      }
+      return res;
+    }
+  }  
+}
+
+//The CDCL procedure is encoded here
+lbool pSolver::search(int nof_conflicts)
+{
+  assert(ok);
+  int          backtrack_level;
+  int          conflictC = 0;
+  vec<Lit>     learnt_clause;
+  unsigned int nblevels;
+  bool         blocked=false;
+  starts++;
+
+  
+  for (;;){
+
+    pthread_testcancel();
+    CRef confl = propagate();
+    
+  
+    if (confl != CRef_Undef){  
+      conflicts++; conflictC++;
+      if (verbosity >= 1 && conflicts%verbEveryConflicts==0){
+	printf("c |%5d| %1d   %7d    %5d | %7d %8d %8d | %5d %8d   %6d %8d | %6.3f %% | \n",
+	       id,  
+	       (int)starts,(int)nbstopsrestarts, (int)(conflicts/starts), 
+	       (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : 
+				trail_lim[0]), nClauses(), 
+	       (int)clauses_literals, 
+	       (int)nbReduceDB, nLearnts(), 
+	       (int)nbDL2,(int)nbRemovedClauses, 
+	       progressEstimate()*100);
+      }
+	
+      if (decisionLevel() == 0) 
+	return l_False;    
+	
+      trailQueue.push(trail.size());
+	
+      if( conflicts>LOWER_BOUND_FOR_BLOCKING_RESTART && 
+	  lbdQueue.isvalid()  && 
+	  trail.size()>R*trailQueue.getavg()) {
+	lbdQueue.fastclear();
+	nbstopsrestarts++;
+	if(!blocked) {
+	  lastblockatrestart=starts;
+	  nbstopsrestartssame++;
+	  blocked=true;
+	}
+      }
+	
+      learnt_clause.clear();
+      analyze(confl, learnt_clause, backtrack_level,nblevels);
+	
+      lbdQueue.push(nblevels);
+      sumLBD += nblevels;
+  
+      if (nblevels == maxsizeshared)
+	sharedBase->push(learnt_clause, nblevels,this);
+      
+      cancelUntil(backtrack_level);
+	    
+      if (learnt_clause.size() == 1){
+	uncheckedEnqueue(learnt_clause[0]);nbUn++;
+      }else{
+	CRef cr = ca.alloc(learnt_clause, true);
+	ca[cr].setLBD(nblevels); 
+	if(nblevels<=2) nbDL2++; // stats
+	if(ca[cr].size()==2) nbBin++; // stats
+	learnts.push(cr);
+	attachClause(cr);
+	      
+	claBumpActivity(ca[cr]);
+	uncheckedEnqueue(learnt_clause[0], cr);
+      }
+      varDecayActivity();
+      claDecayActivity();
+	
+    }else{
+
+      // Our dynamic restart, see the SAT09 competition compagnion paper 
+      if ((lbdQueue.isvalid() && 
+	   ((lbdQueue.getavg()*K) > (sumLBD / conflicts)))) {
+	
+	lbdQueue.fastclear();
+	progress_estimate = progressEstimate();
+	cancelUntil(0);
+	return l_Undef; 
+      }
+
+      // Simplify the set of problem clauses:
+      if (decisionLevel() == 0 && !simplify()) {
+	return l_False;
+      }
+
+      // Perform clause database reduction !
+      if(conflicts>=(uint64_t)curRestart* nbclausesbeforereduce) 
+	{	
+	  assert(learnts.size()>0);
+	  curRestart = (conflicts/ nbclausesbeforereduce)+1;
+	  reduceDB();
+	  nbclausesbeforereduce += incReduceDB;
+	}
+	    
+      Lit next = lit_Undef;
+
+      while (decisionLevel() < assumptions.size()){
+	// Perform user provided assumption:
+	Lit p = assumptions[decisionLevel()];
+	if (value(p) == l_True){
+	  // Dummy decision level:
+	  newDecisionLevel();
+	}else if (value(p) == l_False){
+	  // analyzeFinal(~p, conflict);
+	  return l_False;
+	}else{
+	  next = p;
+	  break;
+	}
+      }
+       
+      if (next == lit_Undef){
+	// New variable decision:
+	decisions++;
+	next = pickBranchLit();
+	// The problem is solved 
+	if (next == lit_Undef){
+	  return l_True;
+	}
+      }
+
+      // Increase decision 
+      // level and enqueue 'next'
+      newDecisionLevel();
+      uncheckedEnqueue(next);
+    }
+  }
+}
+
+//The CDCL procedure is encoded here
+lbool pSolver::search( Lit next )
+{
+  assert(ok);
+  int          backtrack_level;
+  int          conflictC = 0;
+  vec<Lit>     learnt_clause;
+  unsigned int nblevels;
+  bool         blocked=false;
+  starts++;
+
+  for (;;){
+    
+    pthread_testcancel();
+    CRef confl = propagate();
+    if (confl != CRef_Undef){
+
+      conflicts++; conflictC++;
+      if (verbosity >= 1 && conflicts%verbEveryConflicts==0){
+	printf("c |%5d| %1d   %7d    %5d | %7d %8d %8d | %5d %8d   %6d %8d | %6.3f %% |\n",
+	       id,  
+	       (int)starts,(int)nbstopsrestarts, (int)(conflicts/starts), 
+	       (int)dec_vars - (trail_lim.size() == 0 ? trail.size() : 
+				trail_lim[0]), nClauses(), 
+	       (int)clauses_literals, 
+	       (int)nbReduceDB, nLearnts(), 
+	       (int)nbDL2,(int)nbRemovedClauses, 
+	       progressEstimate()*100);
+      }
+	
+      if (decisionLevel() == 0) 
+	return l_False;    
+	
+      trailQueue.push(trail.size());
+	
+      if( conflicts>LOWER_BOUND_FOR_BLOCKING_RESTART && 
+	  lbdQueue.isvalid()  && 
+	  trail.size()>R*trailQueue.getavg()) {
+	lbdQueue.fastclear();
+	nbstopsrestarts++;
+	if(!blocked) {
+	  lastblockatrestart=starts;
+	  nbstopsrestartssame++;
+	  blocked=true;
+	}
+      }
+	
+      learnt_clause.clear();
+      analyze(confl, learnt_clause, backtrack_level,nblevels);
+	
+      lbdQueue.push(nblevels);
+      sumLBD += nblevels;
+
+      if (nblevels ==maxsizeshared)
+      	sharedBase->push(learnt_clause, nblevels,this);
+     
+      cancelUntil(backtrack_level);
+	    
+      if (learnt_clause.size() == 1){
+	uncheckedEnqueue(learnt_clause[0]);nbUn++;
+      }else{
+	CRef cr = ca.alloc(learnt_clause, true);
+	ca[cr].setLBD(nblevels); 
+	if(nblevels<=2) nbDL2++; // stats
+	if(ca[cr].size()==2) nbBin++; // stats
+	learnts.push(cr);
+	attachClause(cr);
+	      
+	claBumpActivity(ca[cr]);
+	uncheckedEnqueue(learnt_clause[0], cr);
+      }
+      varDecayActivity();
+      claDecayActivity();
+	
+    }else{
+
+      // Our dynamic restart, see the SAT09 competition compagnion paper 
+      if ((lbdQueue.isvalid() && 
+	   ((lbdQueue.getavg()*K) > (sumLBD / conflicts)))) {
+	lbdQueue.fastclear();
+	progress_estimate = progressEstimate();
+	cancelUntil(0);
+	return l_Undef; 
+      }
+
+      // Simplify the set of problem clauses:
+      if (decisionLevel() == 0 && !simplify()) {
+	return l_False;
+      }
+
+      // Perform clause database reduction !
+      if(conflicts>=(uint64_t)curRestart* nbclausesbeforereduce) 
+	{	
+	  assert(learnts.size()>0);
+	  curRestart = (conflicts/ nbclausesbeforereduce)+1;
+	  reduceDB();
+	  nbclausesbeforereduce += incReduceDB;
+	}	    
+   
+      if (next == lit_Undef){
+	// New variable decision:
+	decisions++;
+	next = pickBranchLit();
+	// The problem is solved 
+	if (next == lit_Undef)
+	  return l_True;
+	
+      }
+
+      // Increase decision 
+      // level and enqueue 'next'
+      newDecisionLevel();
+      uncheckedEnqueue(next);
+      next=lit_Undef;
+    }
+  }
+}
+
+//In the portfolio phase, we stop all threads  
+//when pfstopNB % of the workers have learned
+//an amount of pfstopDB % of the size of original clauses' DB.
+bool pSolver::grestart(pSolver *data[]){
+
+  int cpt =0;
+  for (int i=1; i<nbworkers;++i){
+    if((double)data[i]->learnts.size()/
+       (double)data[i]->clauses.size() >= pfstopDB){
+      cpt++;
+    }
+  }
+
+  if(cpt < pfstopNB * (nbworkers-1))
+     return false;
+
+  return true;
+}
+
+//To start the divide an conquer phase, 
+//we chose the liternals' order given 
+//by the worker which progressed the best.
+int pSolver::getbpick(pSolver *data[]){
+  
+  data[1]->cancelUntil(0);
+  int max=1;
+
+  for (int i=2; i<nbworkers;++i){
+    data[i]->cancelUntil(0);
+    
+    if(data[max]->progressEstimate() <
+       data[i]->progressEstimate()) 
+      max = i;
+    
+  }
+
+  for (int i=1; i<nbworkers;++i){
+    if(i!=max){
+      data[i]->order_heap.clear();
+      data[max]->activity.copyTo(data[i]->activity);
+      for(int j=0; j<data[max]->order_heap.size();++j)
+	data[i]->insertVarOrder(data[max]->order_heap[j]);
+      
+    }
+  }
+  
+  return max;
+    
+}
+
+
+//The initialisation method. It starts 
+//all other threads and wait for the
+//termination of one of theim. 
+void pSolver::solveMultiThreaded(int h, int t, pSolver *data[]){
+  
+  nbworkers=t;
+  // getfirstLits();
+  solvers=data;
+  mpz_t ret;
+  mpz_init(ret);
+  mpz_set_si(ret,0);    
+  bool rstart=true;
+  int curr_restarts =0;
+  double rest_base = restart_base; 
+  long long cpt=0;
+ 
+
+  if (!ok) return;
+
+  sumLBD = 0;  
+  lbdQueue.initSize(sizeLBDQueue);
+  trailQueue.initSize(sizeTrailQueue);
+  nbclausesbeforereduce = firstReduceDB;
+ 
+
+   if(verbosity>=1) {
+      printf("c ========================================[ MAGIC CONSTANTS ]==============================================\n");
+      printf("c | Constants are supposed to work well together :-)                                                      |\n");
+      printf("c | however, if you find better choices, please let us known...                                           |\n");
+      printf("c |-------------------------------------------------------------------------------------------------------|\n");
+      printf("c |                                |                                |                                     |\n"); 
+      printf("c | - Restarts:                    | - Reduce Clause DB:            | - Minimize Asserting:               |\n");
+      printf("c |   * LBD Queue    : %6d      |   * First     : %6d         |    * size < %3d                     |\n",lbdQueue.maxSize(),firstReduceDB,lbSizeMinimizingClause);
+      printf("c |   * Trail  Queue : %6d      |   * Inc       : %6d         |    * lbd  < %3d                     |\n",trailQueue.maxSize(),incReduceDB,lbLBDMinimizingClause);
+      printf("c |   * K            : %6.2f      |   * Special   : %6d         |                                     |\n",K,specialIncReduceDB);
+      printf("c |   * R            : %6.2f      |   * Protected :  (lbd)< %2d     |                                     |\n",R,lbLBDFrozenClause);
+      printf("c |                                |                                |                                     |\n"); 
+      printf("c ==================================[ Search Statistics (every %6d conflicts) ]=========================\n",verbEveryConflicts);
+      printf("c |                                                                                                       |\n");      
+      printf("c |          RESTARTS           |          ORIGINAL         |              LEARNT              | Progress |\n");
+      printf("c |Thrd | NB   Blocked  Avg Cfc |    Vars  Clauses Literals |   Red   Learnts    LBD2  Removed |          |\n");
+      printf("c =========================================================================================================\n");
+      printf("c =========================================================================================================\n");
+      printf("c |                                          Mode Portfolio                                               |\n"); 
+      printf("c =========================================================================================================\n");
+   }
+
+   folio =true;
+   for (int i=1; i<nbworkers; i++)
+     sharedJob->tids[i-1]=create_worker(data[i]);
+   
+   while (true){
+     
+     usleep(5000);
+     
+     sharedJob->getResult(ret);
+       
+     if (stop(ret)){       
+       for (int i=1; i<nbworkers; i++){
+	 pthread_cancel(sharedJob->tids[i-1]);
+	 pthread_join(sharedJob->tids[i-1], NULL);
+       }
+
+       if (verbosity >= 1)
+	 printf("c =========================================================================================================\n");
+       
+       mpz_clear(ret);
+
+       return;
+     }
+
+     if(grestart(data)){
+       for (int i=1; i<nbworkers; i++){
+	 pthread_cancel(sharedJob->tids[i-1]);
+	 pthread_join(sharedJob->tids[i-1], NULL); 
+       }
+
+       folio =false;
+       break;
+     }
+       
+   }
+
+   sharedJob->getResult(ret);
+   if ( stop(ret)){
+     if (verbosity >= 1)
+       printf("c =========================================================================================================\n");
+     
+     mpz_clear(ret);
+     return;
+   }
+   
+   if (verbosity >= 1){
+     printf("c =========================================================================================================\n");
+     printf("c |                                          Mode Divide and Conquer                                      |\n"); 
+     printf("c =========================================================================================================\n");
+   }
+
+   while(true){
+     cpt++;
+
+     if(rstart){
+
+       sharedJob->init(nbworkers, h, 1<<h);
+
+       int s = getbpick(data);
+
+       if( data[s]->createJobs(h)){
+	 mpz_set_si(ret, 1);
+	 sharedJob->putResult(ret);
+	 break;
+       }
+       else{
+	 sharedJob->IFinish();
+	 
+	 for (int i=1; i<t; i++)
+	   sharedJob->tids[i-1] =  create_worker(data[i]);
+       }
+       rstart=false;
+     }
+    
+     usleep(5000);
+     sharedJob->getResult(ret);
+       
+     if (stop(ret)){
+       
+       for (int i=1; i<nbworkers; i++){
+	 pthread_cancel(sharedJob->tids[i-1]);
+	 pthread_join(sharedJob->tids[i-1], NULL);
+       }
+       break;
+     }
+
+    if(rest_base == cpt){
+      if (verbosity >= 1){
+	 printf("c =========================================================================================================\n");
+	 printf("c |                                          Global Restart : %6d                                      |\n",curr_restarts+1); 
+	 printf("c =========================================================================================================\n");
+       }
+       
+       for (int i=1; i<nbworkers; i++){
+	 pthread_cancel(sharedJob->tids[i-1]);
+	 pthread_join(sharedJob->tids[i-1], NULL); 
+       }
+       
+       rstart=true;
+       rest_base =  pow(2, ++curr_restarts)*restart_base; 
+    }
+    
+   }
+
+  if (verbosity >= 1)
+    printf("c =========================================================================================================\n");
+  
+  mpz_clear(ret);
+}
+
+
+void  pSolver::printStats() {
+  printf("c Jobs done             : %d \n", nbjobs);
+  printf("c CPU Thread time       : %g s\n", thtime);
+  printf("c nb Shared learnts     : %d\n", sharedBase->getTotalDB(id));
+  printf("c nb Red. Sh. learnts   : %d\n", sharedBase->getTotalSDB(id));
+}

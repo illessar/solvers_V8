@@ -1,0 +1,10 @@
+Solver name : pglucose
+Solver version : 0.1
+Authors : Souheib Baarir and Julien Sopena and  Julia Lawall
+
+
+For compiling : 
+   ./build.sh
+
+For running :
+pglucose  BENCHNAME
